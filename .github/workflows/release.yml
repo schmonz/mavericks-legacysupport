@@ -1,0 +1,133 @@
+name: release
+
+# Builds the x86_64/min-10.9 macports-legacy-support .pkg on a modern Apple-Silicon runner
+# (cross-target). One pipeline, three entry points:
+#   - push to main: if UPSTREAM_VERSION has no release yet (Renovate just bumped it) -> cut
+#     v<upstream>-mavericks.1. Otherwise build only (CI smoke), no release.
+#   - workflow_dispatch (local_release=true): cut the next v<upstream>-mavericks.(N+1).
+#   - v* tag: publish that exact version.
+# gh release create makes the tag as part of publishing, so there is no second-hop trigger
+# problem (GITHUB_TOKEN cannot retrigger a tag workflow) and no PAT is needed.
+
+on:
+  push:
+    branches: [main]
+    tags: ['*-mavericks.*']
+  workflow_dispatch:
+    inputs:
+      local_release:
+        description: "Cut a local -mavericks.(N+1) release for the current upstream version"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26   # Apple Silicon; cross-builds x86_64/10.9. Use macos-15 if 26 is unavailable.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # version.sh needs the full tag history
+
+      - name: Install mavericks-shared-cmake
+        # shared-cmake installs itself via its own action (self-registers in the CMake user
+        # package registry). We do NOT clone it, hand-run cmake install, or vendor it as a
+        # nested git checkout. @v1 is the moving major tag; Renovate's github-actions manager
+        # tracks it (no SHA, no marker comment).
+        uses: ModernMavericks/shared-cmake/.github/actions/install@v1
+
+      - name: Resolve the installed shared-cmake scripts dir
+        id: msc
+        run: |
+          dir="$(cat "$HOME/.cmake/packages/MavericksSharedCMake/"* | head -1)/scripts"
+          [ -d "$dir" ] || { echo "::error::shared-cmake scripts not found at $dir"; exit 1; }
+          echo "scripts=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version
+        id: ver
+        run: |
+          set -eu
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            full="$GITHUB_REF_NAME"; tag="$GITHUB_REF_NAME"; rel=yes
+          else
+            mode=auto
+            if [ "${{ github.event_name }}" = workflow_dispatch ] && [ "${{ inputs.local_release }}" = "true" ]; then
+              mode=local
+            fi
+            out="$(sh build/version.sh "$mode")"
+            full="$(printf '%s\n' "$out" | sed -n 's/^FULL=//p')"
+            tag="$(printf '%s\n' "$out"  | sed -n 's/^TAG=//p')"
+            rel="$(printf '%s\n' "$out"  | sed -n 's/^RELEASE=//p')"
+          fi
+          printf '%s\n' "$full" > VERSION
+          { echo "full=$full"; echo "tag=$tag"; echo "release=$rel"; } >> "$GITHUB_OUTPUT"
+          echo "version=$full tag=$tag release=$rel"
+
+      - name: Cross-build the library (x86_64 / min-10.9)
+        run: sh build/build-lib.sh
+
+      - name: Build the Sparkle updater (Cocoa/ObjC; must not link the library)
+        run: |
+          B=build/updater
+          cmake -S . -B "$B" -DCMAKE_OBJC_COMPILER=/usr/bin/clang
+          cmake --build "$B" --target LegacySupportUpdater
+          bin="$B/LegacySupportUpdater.app/Contents/MacOS/LegacySupportUpdater"
+          otool -L "$bin" | tee /tmp/o.txt
+          ! grep -qi MacportsLegacySupport /tmp/o.txt || { echo "::error::updater links the library it updates"; exit 1; }
+
+      - name: Package the .pkg (library + updater + 10.9.5 floor)
+        run: |
+          UPD_APP="build/updater/LegacySupportUpdater.app" \
+          VERSION="${{ steps.ver.outputs.full }}" \
+          sh build/package-pkg.sh
+
+      - name: EdDSA-sign the .pkg + generate the appcast
+        if: steps.ver.outputs.release == 'yes'
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}   # sign_and_appcast.sh fetches ed25519-sign via `gh` -> needs auth (else 403 rate-limit)
+        run: |
+          [ -n "$SPARKLE_PRIVATE_KEY" ] || { echo "::error::SPARKLE_PRIVATE_KEY secret not set"; exit 1; }
+          SCRIPTS='${{ steps.msc.outputs.scripts }}'
+          FULL="${{ steps.ver.outputs.full }}"; TAG="${{ steps.ver.outputs.tag }}"
+          PKG="build/out/macports-legacy-support-${FULL}.pkg"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$PKG")"
+          NOTES="$(sh build/release-notes-file.sh "$TAG" "$FULL")"
+          sh "$SCRIPTS/sign_and_appcast.sh" \
+            --channel-title "MacPorts legacy-support (Mavericks)" --version "$FULL" \
+            --pkg-url "$URL" --notes-file "$NOTES" --pkg "$PKG" --min-os 10.9.5 \
+            > build/out/appcast.xml
+          cat build/out/appcast.xml
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp "build/out/macports-legacy-support-${{ steps.ver.outputs.full }}.pkg" dist/
+          [ -f build/out/appcast.xml ] && cp build/out/appcast.xml dist/ || true
+          ( cd dist && shasum -a 256 *.pkg > SHA256SUMS )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mavericks-legacysupport
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: steps.ver.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          NOTES="release-notes/${TAG}.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          elif [ -f "$NOTES" ]; then
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file "$NOTES"
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+          fi

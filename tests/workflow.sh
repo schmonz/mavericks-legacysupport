@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+w=.github/workflows/release.yml
+# correct shared-cmake usage: install ONLY via the action, pinned to @v1 (Renovate's
+# native github-actions manager tracks the moving major tag -- no SHA, no marker comment).
+grep -Eq 'uses: ModernMavericks/shared-cmake/\.github/actions/install@v1' "$w" \
+  || { echo "install action not pinned to @v1"; exit 1; }
+grep -q 'cmake --install' "$w" && { echo "must NOT hand-install shared-cmake in CI"; exit 1; }
+grep -q 'submodule' "$w" && { echo "must NOT submodule shared-cmake"; exit 1; }
+grep -q 'build/version.sh' "$w" || { echo "workflow must derive version via build/version.sh"; exit 1; }
+grep -q 'build/build-lib.sh' "$w" || { echo "workflow must build the library"; exit 1; }
+grep -q 'build/package-pkg.sh' "$w" || { echo "workflow must package"; exit 1; }
+grep -q 'SPARKLE_PRIVATE_KEY' "$w" || { echo "workflow must sign"; exit 1; }
+grep -q 'gh release' "$w" || { echo "workflow must publish via gh release"; exit 1; }
+grep -q 'fetch-depth: 0' "$w" || { echo "checkout must fetch tags (fetch-depth: 0)"; exit 1; }
+echo "workflow OK"
