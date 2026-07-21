@@ -1,0 +1,6 @@
+/VERSION
+build/
+dist/
+._*
+.DS_Store
+.superpowers/
